@@ -15,18 +15,20 @@ Scope: `$ARGUMENTS` if given (a directory or file path), otherwise the whole rep
    ```bash
    git ls-files -- "${ARGUMENTS:-.}" | grep -E '\.(tf|ya?ml|sh|py)$' \
      | tr '\n' '\0' \
-     | xargs -0 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/comment_diet.py"
+     | xargs -0 -r python3 "${CLAUDE_PLUGIN_ROOT}/scripts/comment_diet.py"
    ```
 
    Pipe the list — don't collect it into a variable and expand it. zsh does not
    word-split an unquoted `$FILES`, so `python3 comment_diet.py $FILES` passes the entire
    list as one argument. `tr`/`xargs -0` is correct in every shell and survives paths
-   containing spaces. If `grep` finds nothing it exits 1 and the pipeline reports no
-   supported files in scope, which is not a violation.
+   containing spaces. `-r` keeps an empty scope silent: BSD xargs already skips, but GNU
+   xargs would run the linter with no arguments and print its usage hint, which describes
+   a different failure.
 
-   Exit codes: **0** clean, **1** violations found, **2** the linter could not run
-   (bad arguments, unreadable file, malformed config). Treat a 2 as a broken invocation
-   to fix, never as a pass.
+   Exit codes when invoked directly: **0** clean, **1** violations found, **2** the linter
+   could not run (bad arguments, unreadable file, malformed config). Through `xargs` any
+   non-zero becomes **123**, so judge the run by its output lines, and treat a `comment-diet:`
+   error line as a broken invocation to fix — never as a pass.
 
    Each `path:start-end: comment block longer than N line(s)` line is a hard violation, as is any
    `comment narrates the road not taken`; each `warning: path:line: comment ...` is a banner,

@@ -101,7 +101,8 @@ The CLI exits **0** clean, **1** on violations, and **2** when it could not run 
 arguments, an unreadable file, a malformed config. It refuses to inspect nothing quietly: pass a
 path that doesn't exist, or a whole newline-joined file list as one argument (what an unquoted
 `$FILES` becomes in zsh, which doesn't word-split), and you get exit 2 with a diagnosis instead of a
-clean bill of health. Pipe file lists through `tr '\n' '\0' | xargs -0`.
+clean bill of health. Pipe file lists through `tr '\n' '\0' | xargs -0 -r` (`-r` so an empty scope
+runs nothing instead of tripping the usage check on GNU xargs).
 
 The division of labour is deliberate: a regex is the tripwire, the agent is the resolver. The hook
 never rewrites your comment — it hands the agent the finding and the three legitimate resolutions
