@@ -1,0 +1,12 @@
+{
+  "name": "comment-diet",
+  "description": "Puts your comments on a diet: one line, or none. A PostToolUse hook (with a Stop backstop) blocks multi-line comment blocks, banners, narration, and road-not-taken comments in .tf/.yml/.yaml/.sh/.py the moment an agent writes them, scoped to the current change so pre-existing comments never trip. Ships a writing-comments skill so comments come out lean in the first place, and a /comment-diet:audit command to clean up files that predate the plugin. Configure thresholds, patterns, and excludes in .comment-diet.json. No dependencies.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Ben Girard",
+    "url": "https://github.com/benjy44"
+  },
+  "homepage": "https://github.com/benjy44/comment-diet",
+  "license": "MIT",
+  "keywords": ["comments", "linter", "hooks", "code-quality", "terraform", "python"]
+}
