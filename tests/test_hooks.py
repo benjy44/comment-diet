@@ -64,3 +64,51 @@ def test_cli_audits_whole_files_and_exits_1(repo, cli):
 def test_cli_clean_exits_0(repo, cli):
     repo.write("a.tf", "# a single non-obvious why\nx = 1\n")
     assert cli("a.tf").returncode == 0
+
+
+def test_cli_rejects_an_unsplit_file_list(repo, cli):
+    """A whole newline-joined list arriving as one argument must not read as a pass.
+
+    zsh doesn't word-split `$FILES`, so the old `python3 lint.py $FILES` passed one
+    6 KB argument and exited 0 having inspected nothing.
+    """
+    names = [repo.write(f"a{i}.tf", BLOCK) for i in range(3)]
+    result = cli("\n".join(names))
+    assert result.returncode == 2
+    assert "no such path" in result.stderr and "xargs" in result.stderr
+
+
+def test_cli_rejects_no_arguments(repo, cli):
+    result = cli()
+    assert result.returncode == 2 and "usage" in result.stderr
+
+
+def test_cli_rejects_a_missing_path(repo, cli):
+    result = cli("nope.tf")
+    assert result.returncode == 2 and "no such path" in result.stderr
+
+
+def test_cli_rejects_a_scope_with_no_supported_files(repo, cli):
+    repo.write("README.md", "# not code\n# at all\n")
+    result = cli("README.md")
+    assert result.returncode == 2 and "supported file type" in result.stderr
+
+
+def test_cli_fails_on_an_undecodable_file(repo, cli):
+    (repo.path / "bad.tf").write_bytes(b"# why\n\xff\xfe not utf-8\n")
+    result = cli("bad.tf")
+    assert result.returncode == 2 and "cannot read" in result.stderr
+
+
+def test_hooks_skip_an_undecodable_file(repo, hook):
+    """The hooks race an agent mid-write, so an unreadable file is skipped, not fatal."""
+    (repo.path / "bad.tf").write_bytes(b"# why\n\xff\xfe not utf-8\n")
+    repo.write("good.tf", BLOCK)
+    out = decision(hook("--stop-hook", "{}"))
+    assert out["decision"] == "block" and "good.tf" in out["reason"]
+    assert "bad.tf" not in out["reason"]
+
+
+def test_post_tool_use_survives_a_file_deleted_mid_turn(repo, hook):
+    payload = json.dumps({"tool_input": {"file_path": "vanished.tf"}})
+    assert decision(hook("--post-tool-use", payload)) is None

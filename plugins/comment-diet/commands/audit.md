@@ -13,9 +13,20 @@ Scope: `$ARGUMENTS` if given (a directory or file path), otherwise the whole rep
 1. Discover the files and run the deterministic linter over them:
 
    ```bash
-   FILES=$(git ls-files -- ${ARGUMENTS:-.} | grep -E '\.(tf|ya?ml|sh|py)$')
-   [ -n "$FILES" ] && python3 "${CLAUDE_PLUGIN_ROOT}/scripts/comment_diet.py" $FILES
+   git ls-files -- "${ARGUMENTS:-.}" | grep -E '\.(tf|ya?ml|sh|py)$' \
+     | tr '\n' '\0' \
+     | xargs -0 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/comment_diet.py"
    ```
+
+   Pipe the list — don't collect it into a variable and expand it. zsh does not
+   word-split an unquoted `$FILES`, so `python3 comment_diet.py $FILES` passes the entire
+   list as one argument. `tr`/`xargs -0` is correct in every shell and survives paths
+   containing spaces. If `grep` finds nothing it exits 1 and the pipeline reports no
+   supported files in scope, which is not a violation.
+
+   Exit codes: **0** clean, **1** violations found, **2** the linter could not run
+   (bad arguments, unreadable file, malformed config). Treat a 2 as a broken invocation
+   to fix, never as a pass.
 
    Each `path:start-end: comment block longer than N line(s)` line is a hard violation, as is any
    `comment narrates the road not taken`; each `warning: path:line: comment ...` is a banner,

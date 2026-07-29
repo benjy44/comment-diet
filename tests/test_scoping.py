@@ -1,4 +1,6 @@
 """Diff scoping — only comments the current change touched count."""
+import pytest
+
 import comment_diet as cd
 
 BLOCK = "# why one\n# why two\n"
@@ -23,8 +25,11 @@ def test_untracked_file_is_audited_whole(repo):
     assert len(cd.collect(["a.tf"], cd.DEFAULTS)[0]) == 1
 
 
-def test_missing_file_is_a_no_op(repo):
-    assert cd.collect(["gone.tf"], cd.DEFAULTS) == ([], [])
+def test_missing_file_raises_unless_explicitly_skipped(repo):
+    """Swallowing an unreadable path silently is how a mis-invocation looked clean."""
+    with pytest.raises(OSError):
+        cd.collect(["gone.tf"], cd.DEFAULTS)
+    assert cd.collect(["gone.tf"], cd.DEFAULTS, skip_unreadable=True) == ([], [])
 
 
 def test_changed_files_includes_untracked_and_drops_deleted(repo):

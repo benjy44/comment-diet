@@ -303,8 +303,11 @@ def added_linenos(path):
 
 
 def check_file(path, cfg, conf, whole_file=False):
-    if not os.path.exists(path):
-        return [], [], []
+    """Findings for one file. Raises OSError/UnicodeDecodeError if it can't be read.
+
+    The caller decides what an unreadable file means: the CLI fails, the hooks
+    skip it. A linter that silently inspects nothing must never look like a pass.
+    """
     with open(path, encoding="utf-8") as f:
         lines = f.read().splitlines()
     added = None if whole_file else added_linenos(path)
@@ -316,17 +319,24 @@ def check_file(path, cfg, conf, whole_file=False):
             warnings(prose, added, conf))
 
 
-def collect(paths, conf, whole_file=False):
+def collect(paths, conf, whole_file=False, skip_unreadable=False):
     """(violation lines, warning lines) as human-readable strings across paths.
 
     whole_file audits every line (the CLI audit); otherwise scope to the change.
+    skip_unreadable swallows a file that vanished or won't decode — the hooks race
+    against an agent still editing, where the CLI wants the error.
     """
     viol_lines, warn_lines = [], []
     for path in paths:
         cfg = lang_for(path)
         if cfg is None or excluded(path, conf.exclude):
             continue
-        viols, contras, warns = check_file(path, cfg, conf, whole_file)
+        try:
+            viols, contras, warns = check_file(path, cfg, conf, whole_file)
+        except (OSError, UnicodeDecodeError):
+            if skip_unreadable:
+                continue
+            raise
         for start, end in viols:
             plural = "line" if conf.max_lines == 1 else "lines"
             viol_lines.append(f"{path}:{start}-{end}: comment block longer than "
@@ -377,7 +387,7 @@ def post_tool_use_hook():
     path = (payload.get("tool_input") or {}).get("file_path")
     if not path or lang_for(path) is None or not os.path.exists(path):
         return 0
-    return _block(*collect([path], hook_config()))
+    return _block(*collect([path], hook_config(), skip_unreadable=True))
 
 
 def stop_hook():
@@ -393,17 +403,52 @@ def stop_hook():
         payload = {}
     if payload.get("stop_hook_active"):
         return 0
-    return _block(*collect(changed_files(), hook_config()))
+    return _block(*collect(changed_files(), hook_config(), skip_unreadable=True))
+
+
+USAGE = ("usage: comment_diet.py <file>... — audits whole files.\n"
+         "Pipe a file list in rather than expanding a variable: shells differ on "
+         "word-splitting (zsh doesn't split $VAR), so use\n"
+         "  ... | tr '\\n' '\\0' | xargs -0 python3 comment_diet.py")
+
+
+def check_argv(argv):
+    """Reason the arguments can't be audited, or None.
+
+    Guards against a mis-invocation that inspects nothing — the whole file list
+    arriving as one unsplit argument, a typo'd path, a scope with no supported
+    files. Each of those used to exit 0 and read as a clean bill of health.
+    """
+    if not argv:
+        return USAGE
+    missing = [p for p in argv if not os.path.exists(p)]
+    if missing:
+        shown = ", ".join(repr(p[:60]) for p in missing[:3])
+        return (f"no such path: {shown}" +
+                (f" (+{len(missing) - 3} more)" if len(missing) > 3 else "") +
+                ("\n" + USAGE if len(argv) == 1 and "\n" in argv[0] else ""))
+    if not any(lang_for(p) for p in argv):
+        return (f"none of the {len(argv)} given path(s) is a supported file type "
+                f"({', '.join(SUFFIXES)})")
+    return None
 
 
 def main(argv):
-    """Audit the given files in full; exit 1 on any violation, 2 on a bad config."""
+    """Audit the given files in full; 1 on a violation, 2 on a bad config or invocation."""
+    problem = check_argv(argv)
+    if problem:
+        print(f"comment-diet: {problem}", file=sys.stderr)
+        return 2
     try:
         conf = load_config()
     except ConfigError as exc:
         print(f"comment-diet: {exc}", file=sys.stderr)
         return 2
-    viol_lines, warn_lines = collect(argv, conf, whole_file=True)
+    try:
+        viol_lines, warn_lines = collect(argv, conf, whole_file=True)
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"comment-diet: cannot read {exc}", file=sys.stderr)
+        return 2
     for line in viol_lines:
         print(line)
     for line in warn_lines:

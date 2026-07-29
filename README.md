@@ -97,6 +97,12 @@ place instead of only getting caught. Prevention beats blocking.
 **`/comment-diet:audit [path]`** audits *whole files* rather than the current change, for cleaning
 up a codebase that predates the plugin.
 
+The CLI exits **0** clean, **1** on violations, and **2** when it could not run at all — bad
+arguments, an unreadable file, a malformed config. It refuses to inspect nothing quietly: pass a
+path that doesn't exist, or a whole newline-joined file list as one argument (what an unquoted
+`$FILES` becomes in zsh, which doesn't word-split), and you get exit 2 with a diagnosis instead of a
+clean bill of health. Pipe file lists through `tr '\n' '\0' | xargs -0`.
+
 The division of labour is deliberate: a regex is the tripwire, the agent is the resolver. The hook
 never rewrites your comment — it hands the agent the finding and the three legitimate resolutions
 (keep one line, move it to the README, delete it) and lets it choose.
