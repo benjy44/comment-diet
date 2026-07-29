@@ -95,9 +95,11 @@ def test_cli_rejects_a_scope_with_no_supported_files(repo, cli):
 
 
 def test_cli_fails_on_an_undecodable_file(repo, cli):
+    """UnicodeDecodeError doesn't name the file, so collect() attaches the path."""
     (repo.path / "bad.tf").write_bytes(b"# why\n\xff\xfe not utf-8\n")
     result = cli("bad.tf")
-    assert result.returncode == 2 and "cannot read" in result.stderr
+    assert result.returncode == 2
+    assert "cannot read" in result.stderr and "bad.tf" in result.stderr
 
 
 def test_hooks_skip_an_undecodable_file(repo, hook):

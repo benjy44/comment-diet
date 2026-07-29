@@ -73,6 +73,10 @@ class ConfigError(Exception):
     """A malformed .comment-diet.json — reported, never guessed at."""
 
 
+class ReadError(Exception):
+    """A file that couldn't be read, named — UnicodeDecodeError alone doesn't say which."""
+
+
 def _typed(data, key, kind):
     """data[key], checked. `True` is an int to Python, so bools are rejected explicitly."""
     value = data[key]
@@ -333,10 +337,10 @@ def collect(paths, conf, whole_file=False, skip_unreadable=False):
             continue
         try:
             viols, contras, warns = check_file(path, cfg, conf, whole_file)
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as exc:
             if skip_unreadable:
                 continue
-            raise
+            raise ReadError(f"{path}: {exc}") from exc
         for start, end in viols:
             plural = "line" if conf.max_lines == 1 else "lines"
             viol_lines.append(f"{path}:{start}-{end}: comment block longer than "
@@ -446,7 +450,7 @@ def main(argv):
         return 2
     try:
         viol_lines, warn_lines = collect(argv, conf, whole_file=True)
-    except (OSError, UnicodeDecodeError) as exc:
+    except ReadError as exc:
         print(f"comment-diet: cannot read {exc}", file=sys.stderr)
         return 2
     for line in viol_lines:

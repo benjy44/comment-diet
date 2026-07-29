@@ -9,7 +9,7 @@
     {
       "name": "comment-diet",
       "source": "./plugins/comment-diet",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "category": "code-quality",
       "description": "Puts your comments on a diet: one line, or none. Blocks multi-line comment blocks, banners, narration, and road-not-taken comments as they're written, scoped to the current change. Configurable via .comment-diet.json; no dependencies."
     }

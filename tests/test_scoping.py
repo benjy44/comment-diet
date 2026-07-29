@@ -27,7 +27,7 @@ def test_untracked_file_is_audited_whole(repo):
 
 def test_missing_file_raises_unless_explicitly_skipped(repo):
     """Swallowing an unreadable path silently is how a mis-invocation looked clean."""
-    with pytest.raises(OSError):
+    with pytest.raises(cd.ReadError, match="gone.tf"):
         cd.collect(["gone.tf"], cd.DEFAULTS)
     assert cd.collect(["gone.tf"], cd.DEFAULTS, skip_unreadable=True) == ([], [])
 
