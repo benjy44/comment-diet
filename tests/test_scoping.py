@@ -1,62 +1,105 @@
-"""Diff scoping — only comments the current change touched count."""
-import pytest
+import os
+import tempfile
+import unittest
+from unittest import mock
 
-import comment_diet as cd
+from tests.loader import cd
 
-BLOCK = "# why one\n# why two\n"
-
-
-def test_pre_existing_comment_does_not_trip(repo):
-    repo.write("a.tf", BLOCK + "x = 1\n")
-    repo.commit()
-    repo.write("a.tf", BLOCK + "x = 1\ny = 2\n")
-    assert cd.collect(["a.tf"], cd.DEFAULTS)[0] == []
+LEGACY = ("// Client talks to the vendor API.\n"
+          "//\n"
+          "// It handles retries, backoff and connection reuse.\n"
+          "type Client struct{}\n")
 
 
-def test_editing_the_comment_trips(repo):
-    repo.write("a.tf", BLOCK + "x = 1\n")
-    repo.commit()
-    repo.write("a.tf", "# why one\n# why two, edited\nx = 1\n")
-    assert len(cd.collect(["a.tf"], cd.DEFAULTS)[0]) == 1
+def _write(tmp, name, text):
+    path = os.path.join(tmp, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
 
 
-def test_untracked_file_is_audited_whole(repo):
-    repo.write("a.tf", BLOCK + "x = 1\n")
-    assert len(cd.collect(["a.tf"], cd.DEFAULTS)[0]) == 1
+class ParseAdded(unittest.TestCase):
+    def test_single_added_line(self):
+        diff = "@@ -0,0 +3 @@\n+new line\n"
+        self.assertEqual(cd.parse_added(diff), {3})
+
+    def test_multiple_hunks(self):
+        diff = "@@ -1,0 +2,2 @@\n+a\n+b\n@@ -9,0 +20 @@\n+c\n"
+        self.assertEqual(cd.parse_added(diff), {2, 3, 20})
+
+    def test_removed_lines_do_not_advance_the_counter(self):
+        diff = "@@ -1,2 +1,1 @@\n-gone\n+kept\n"
+        self.assertEqual(cd.parse_added(diff), {1})
+
+    def test_file_header_is_not_an_added_line(self):
+        diff = "+++ b/x.go\n@@ -0,0 +1 @@\n+a\n"
+        self.assertEqual(cd.parse_added(diff), {1})
 
 
-def test_missing_file_raises_unless_explicitly_skipped(repo):
-    """Swallowing an unreadable path silently is how a mis-invocation looked clean."""
-    with pytest.raises(cd.ReadError, match="gone.tf"):
-        cd.collect(["gone.tf"], cd.DEFAULTS)
-    assert cd.collect(["gone.tf"], cd.DEFAULTS, skip_unreadable=True) == ([], [])
+class DiffScoping(unittest.TestCase):
+    def test_untouched_block_does_not_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "a.go", LEGACY)
+            with mock.patch.object(cd, "added_linenos", return_value={4}):
+                self.assertEqual(cd.check_file(path, cd.lang_for(path), cd.DEFAULTS), [])
+
+    def test_touching_one_line_trips_the_whole_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "a.go", LEGACY)
+            with mock.patch.object(cd, "added_linenos", return_value={3}):
+                findings = cd.check_file(path, cd.lang_for(path), cd.DEFAULTS)
+        self.assertTrue(any("second paragraph" in f.message for f in findings))
+
+    def test_no_diff_audits_the_whole_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "a.go", LEGACY)
+            with mock.patch.object(cd, "added_linenos", return_value=None):
+                findings = cd.check_file(path, cd.lang_for(path), cd.DEFAULTS)
+        self.assertTrue(findings)
+
+    def test_whole_file_mode_ignores_the_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "a.go", LEGACY)
+            with mock.patch.object(cd, "added_linenos", return_value={99}):
+                findings = cd.check_file(path, cd.lang_for(path), cd.DEFAULTS, whole_file=True)
+        self.assertTrue(findings)
 
 
-def test_changed_files_includes_untracked_and_drops_deleted(repo):
-    repo.write("kept.tf", "x = 1\n")
-    repo.write("deleted.tf", "x = 1\n")
-    repo.commit()
-    (repo.path / "deleted.tf").unlink()
-    repo.write("new.py", "x = 1\n")
-    repo.write("ignored.rb", "x = 1\n")
-    assert cd.changed_files() == ["new.py"]
+class Collect(unittest.TestCase):
+    def test_unreadable_file_raises_for_the_cli(self):
+        with self.assertRaises(cd.ReadError):
+            cd.collect(["/nope/missing.go"], cd.DEFAULTS, whole_file=True)
+
+    def test_unreadable_file_is_skipped_for_hooks(self):
+        viols, warns = cd.collect(["/nope/missing.go"], cd.DEFAULTS,
+                                  whole_file=True, skip_unreadable=True)
+        self.assertEqual((viols, warns), ([], []))
+
+    def test_unsupported_file_is_skipped(self):
+        viols, _ = cd.collect(["a.rb"], cd.DEFAULTS, whole_file=True)
+        self.assertEqual(viols, [])
+
+    def test_span_is_rendered_for_multi_line_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, "a.go", LEGACY)
+            viols, _ = cd.collect([path], cd.DEFAULTS, whole_file=True)
+        self.assertTrue(any(":1-3:" in v for v in viols))
 
 
-PATCH = """\
-diff --git a/a.tf b/a.tf
---- a/a.tf
-+++ b/a.tf
-@@ -1,0 +2 @@
-+# added at line 2
-@@ -9 +10 @@
--# gone
-+# replaced at line 10
-"""
+class ChangedFiles(unittest.TestCase):
+    def test_untracked_files_are_included_and_missing_ones_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            here = os.getcwd()
+            os.chdir(tmp)
+            try:
+                _write(tmp, "new.go", "package main\n")
+                outputs = {("diff", "--name-only", "HEAD"): "deleted.go\n",
+                           ("ls-files", "--others", "--exclude-standard"): "new.go\n"}
+                with mock.patch.object(cd, "_git", side_effect=lambda *a: outputs.get(a, "")):
+                    self.assertEqual(cd.changed_files(), ["new.go"])
+            finally:
+                os.chdir(here)
 
 
-def test_parse_added():
-    assert cd.parse_added(PATCH) == {2, 10}
-
-
-def test_parse_added_empty_diff():
-    assert cd.parse_added("") == set()
+if __name__ == "__main__":
+    unittest.main()

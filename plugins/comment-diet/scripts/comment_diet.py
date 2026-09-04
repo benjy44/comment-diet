@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""Keep comments to one line, or none, in hash-comment code (.tf, .yml/.yaml, .sh, .py).
-
-Flags a comment block longer than one line that the current change added — one
-comment line is the bright line, else the explanation belongs in the README.
-Also blocks a single-line comment that narrates the road not taken ("do X, not
-Y, so … never …") — a comment about what the code doesn't do belongs in the
-README if it belongs anywhere. Warns on banner/narration patterns and over-long
-one-liners (a comment that long belongs in the README). Only comments the change
-added (working tree vs HEAD) count, so pre-existing comments never trip on an
-unrelated change.
-String bodies that carry #-lines (tf/sh heredocs, YAML block scalars) are
-skipped; Python is scanned with the stdlib tokenizer, so a # inside a string
-or after code is never a comment.
-
-Thresholds and patterns come from .comment-diet.json at the repo root; see
-DEFAULTS. Extend by adding a LANGS entry (new file type).
-"""
+"""Keep comments to one line, and doc comments to one summary sentence; see the README."""
+import ast
 import fnmatch
 import io
 import json
@@ -24,21 +9,53 @@ import re
 import subprocess
 import sys
 import tokenize
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
-# string_body names the #-carrying string kind (heredoc/yaml_block/pystring) whose body is skipped.
+# string_body names the string kind whose body is skipped; doc, the doc-comment convention.
+_HASH = {"prefixes": ("#",), "kind": "hash"}
+_SLASH = {"prefixes": ("//",), "kind": "slash", "string_body": "backtick"}
 LANGS = {
-    ".tf":   {"prefixes": ("#", "//"), "string_body": "heredoc"},
-    ".sh":   {"prefixes": ("#",),      "string_body": "heredoc"},
-    ".yml":  {"prefixes": ("#",),      "string_body": "yaml_block"},
-    ".yaml": {"prefixes": ("#",),      "string_body": "yaml_block"},
-    ".py":   {"prefixes": ("#",),      "string_body": "pystring"},
+    ".tf":   {**_HASH, "prefixes": ("#", "//"), "string_body": "heredoc", "doc": None},
+    ".sh":   {**_HASH, "string_body": "heredoc", "doc": None},
+    ".yml":  {**_HASH, "string_body": "yaml_block", "doc": None},
+    ".yaml": {**_HASH, "string_body": "yaml_block", "doc": None},
+    ".py":   {**_HASH, "string_body": "pystring", "doc": "docstring"},
+    ".go":   {**_SLASH, "doc": "godoc", "typed": True},
+    ".rs":   {**_SLASH, "prefixes": ("///", "//!", "//"), "string_body": "rust_raw",
+              "doc": "rustdoc", "doc_openers": ("///", "//!", "/**", "/*!"),
+              "typed": True, "sections": True},
+    ".ts":   {**_SLASH, "doc": "jsdoc", "typed": True},
+    ".tsx":  {**_SLASH, "doc": "jsdoc", "typed": True},
+    ".js":   {**_SLASH, "doc": "jsdoc", "typed": False},
+    ".jsx":  {**_SLASH, "doc": "jsdoc", "typed": False},
+    ".mjs":  {**_SLASH, "doc": "jsdoc", "typed": False},
 }
 SUFFIXES = tuple(LANGS)
 
-DIRECTIVE = re.compile(r"checkov:skip=|tflint-ignore", re.IGNORECASE)
+# godoc is missing here because it needs a declaration under it, per is_doc.
+DOC_STYLES = ("jsdoc", "docstring", "rustdoc")
+
 HEREDOC_OPEN = re.compile(r"<<-?(\w+)\s*$")
 YAML_BLOCK = re.compile(r"(?::|^-)\s*[|>][+-]?\d*$")
+BACKTICK = re.compile(r"(?<!\\)`")
+RUST_RAW = re.compile(r'r(#*)"')
+GO_DECL = re.compile(r"^(func|type|const|var|package)\b")
+
+# Matched against a comment stripped of its #, / and * markers.
+DIRECTIVE = re.compile(
+    r"^(go:\w+|nolint|lint:ignore|gosec|nosec|eslint-|@ts-(ignore|expect-error|nocheck)"
+    r"|prettier-ignore|biome-ignore|<reference\b|noqa|type:\s*ignore|pylint:|ruff:|mypy:"
+    r"|fmt:\s*(on|off)|istanbul\b|c8\b|v8\b|@flow\b|jshint\b|jslint\b|global\b|deno-lint)"
+    r"|checkov:skip=|tflint-ignore", re.IGNORECASE)
+
+# An opener frees its whole run: MIT/Apache/BSD boilerplate runs on into lines matching nothing.
+LICENCE = re.compile(
+    r"^(copyright\b|\(c\)\s|©|spdx-|licensed under\b"
+    r"|all rights reserved\b|@license\b|this file is part of\b)", re.IGNORECASE)
+LICENCE_OPENER = re.compile(
+    r"^(licensed under the\b|permission is hereby granted\b"
+    r"|redistribution and use in source\b|this program is free software\b)", re.IGNORECASE)
+
 DEFAULT_WARN_PATTERNS = [
     (re.compile(r"^[-=*#_]{3,}"), "banner/decoration"),
     (re.compile(r"^(create|creates|configure|configures|define|defines|"
@@ -51,8 +68,37 @@ CONTRASTIVE = re.compile(
     r"\bto avoid\b|\bto prevent\b|\botherwise\b|\bso\b[^,.]*\bnever\b",
     re.IGNORECASE)
 
-FIX = ("For each block: reduce to a single non-obvious 'why' line, or move the "
-       "explanation to the root README. Delete banner/narration comments.")
+_SECTIONS = (r"parameters|params|arguments|args|returns?|throws|raises|yields"
+             r"|examples?|usage|notes?|attributes|see also")
+# Only the headers that duplicate a signature; the rest fall to the paragraph rule.
+DOC_SECTION = re.compile(
+    rf"^(#{{1,6}}\s+(parameters|params|arguments|args|returns?)\b|({_SECTIONS})\b\s*:)",
+    re.IGNORECASE)
+# Sections rustdoc readers and clippy expect, each budgeted as its own paragraph.
+KEPT_SECTION = re.compile(r"^#{1,6}\s+(safety|errors|panics|examples?)\b", re.IGNORECASE)
+SAFETY_SECTION = re.compile(r"^#{1,6}\s+safety\b", re.IGNORECASE)
+DOC_FENCE = re.compile(r"^(```|~~~)")
+# Attributes and directives may sit between a doc comment and the item it documents.
+RUST_SKIP = ("#[", "#![", "//")
+RUST_FN = re.compile(r"^(pub\s*(\([^)]*\)\s*)?)?"
+                     r'(default\s+|const\s+|async\s+|extern\s+"[^"]*"\s+)*fn\b')
+DOC_UNDERLINE = re.compile(r"^[-=~^]{3,}\s*$")
+DOC_BULLET = re.compile(r"^([-*+•]|\d+[.)])\s+")
+DOC_TYPE_TAG = re.compile(r"^@(param|returns?|type|arg|argument)\b", re.IGNORECASE)
+DOC_PREAMBLE = re.compile(
+    r"^this (file|function|method|type|struct|class|package|module|interface"
+    r"|component|constant|variable|field|const|var|script|module-level)\b"
+    r"|^(a |the )?(helper|utility|convenience) (function|method|type|class|struct)\b"
+    r"|^(function|method|class|struct|type) (that|which|to)\b", re.IGNORECASE)
+DOC_SIGNATURE = re.compile(r"\b(takes|accepts|receives)\b.{0,80}\breturns?\b", re.IGNORECASE)
+
+SUMMARY_SAYS = ("doc comment", "keep the summary sentence, move the rest to the README",
+                "cut to one concise summary sentence")
+
+
+FIX = ("For each finding: reduce to a single non-obvious 'why' line (a doc comment "
+       "to one concise summary sentence), or move the explanation to the README. "
+       "Delete banners, narration and restated signatures.")
 
 CONFIG_FILE = ".comment-diet.json"
 
@@ -61,12 +107,32 @@ CONFIG_FILE = ".comment-diet.json"
 class Config:
     max_lines: int = 1
     max_length: int = 120
+    max_doc_chars: int = 200
+    warn_doc_chars: int = 120
     contrastive: bool = True
-    warn_patterns: tuple = tuple(DEFAULT_WARN_PATTERNS)
+    docstrings: bool = True
+    warn_patterns: tuple = field(default_factory=lambda: tuple(DEFAULT_WARN_PATTERNS))
     exclude: tuple = ()
 
 
 DEFAULTS = Config()
+
+
+@dataclass(frozen=True)
+class Run:
+    """One contiguous comment: its line span, its prose lines, and its style."""
+    start: int
+    end: int
+    lines: tuple
+    style: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    start: int
+    end: int
+    level: str
+    message: str
 
 
 class ConfigError(Exception):
@@ -104,12 +170,12 @@ def parse_config(data):
     if not isinstance(data, dict):
         raise ConfigError(f"{CONFIG_FILE}: top level must be an object")
     fields = {}
-    if "max_lines" in data:
-        fields["max_lines"] = _typed(data, "max_lines", int)
-    if "max_length" in data:
-        fields["max_length"] = _typed(data, "max_length", int)
-    if "contrastive" in data:
-        fields["contrastive"] = _typed(data, "contrastive", bool)
+    for key in ("max_lines", "max_length", "max_doc_chars", "warn_doc_chars"):
+        if key in data:
+            fields[key] = _typed(data, key, int)
+    for key in ("contrastive", "docstrings"):
+        if key in data:
+            fields[key] = _typed(data, key, bool)
     if "exclude" in data:
         fields["exclude"] = tuple(_typed(data, "exclude", list))
     fields["warn_patterns"] = _compiled_warn_patterns(data)
@@ -135,11 +201,7 @@ def load_config():
 
 
 def hook_config():
-    """Config for a hook run: defaults with a warning if it's broken.
-
-    A broken config must never wedge the agent loop, so the hooks degrade where
-    the CLI (a human is reading) exits non-zero.
-    """
+    """Config for a hook run: defaults with a warning if it's broken, never a hard fail."""
     try:
         return load_config()
     except ConfigError as exc:
@@ -156,38 +218,52 @@ def lang_for(path):
 
 
 def excluded(path, patterns):
-    """True if path matches an exclude glob.
-
-    fnmatch's `*` already crosses `/`, so a leading `**/` is also tried without
-    it — `**/vendor/**` should exclude a top-level `vendor/` too.
-    """
+    """True if path matches an exclude glob, with or without a leading `**/`."""
     posix = path.replace(os.sep, "/")
     return any(fnmatch.fnmatch(posix, p) or fnmatch.fnmatch(posix, p.removeprefix("**/"))
                for p in patterns)
 
 
 def comment_body(s, prefixes):
-    """Comment text with its prefix marker stripped, so warn patterns stay prefix-agnostic."""
+    """Comment text with its prefix marker stripped, so patterns stay prefix-agnostic."""
     for p in prefixes:
         if s.startswith(p):
             return s[len(p):].lstrip()
     return s
 
 
-def py_prose_comments(lines):
-    """(lineno, body) for each full-line # comment in Python source, via tokenize.
+def is_directive(body):
+    """True for a tooling pragma, which is allowed beside code and never counted."""
+    return bool(DIRECTIVE.search(body.lstrip("/*# ").strip()))
 
-    The tokenizer reports COMMENT tokens with their real position, so a # inside
-    a string or trailing a code line never registers — the counting heuristic the
-    other languages use can't distinguish those. Best-effort on unparseable
-    source (mid-edit): tokens seen before the error still count.
-    """
+
+def _run(pairs, style):
+    return Run(pairs[0][0], pairs[-1][0], tuple(b for _, b in pairs), style)
+
+
+def group(prose, style="line"):
+    """Contiguous (lineno, body) pairs grouped into Runs."""
+    runs, cur = [], []
+    for lineno, body in prose:
+        if cur and lineno == cur[-1][0] + 1:
+            cur.append((lineno, body))
+        else:
+            if cur:
+                runs.append(_run(cur, style))
+            cur = [(lineno, body)]
+    if cur:
+        runs.append(_run(cur, style))
+    return runs
+
+
+def py_hash_comments(lines):
+    """(lineno, body) per full-line # comment; on a syntax error, the tokens seen so far count."""
     out = []
     try:
         for tok in tokenize.generate_tokens(io.StringIO("\n".join(lines) + "\n").readline):
             if tok.type != tokenize.COMMENT or tok.line[:tok.start[1]].strip():
                 continue
-            if tok.string.startswith("#!") or DIRECTIVE.search(tok.string):
+            if tok.string.startswith("#!") or is_directive(tok.string):
                 continue
             out.append((tok.start[0], comment_body(tok.string, ("#",))))
     except (tokenize.TokenError, IndentationError, SyntaxError):
@@ -195,14 +271,10 @@ def py_prose_comments(lines):
     return out
 
 
-def prose_comments(lines, cfg):
-    """(lineno, body) for each full-line comment, skipping heredoc/block-scalar bodies.
-
-    Shebangs and checkov/tflint directives don't count — they're allowed beside
-    code, so they break a comment run just like a blank or code line does.
-    """
+def hash_comments(lines, cfg):
+    """(lineno, body) for each full-line comment, skipping heredoc/block-scalar bodies."""
     if cfg["string_body"] == "pystring":
-        return py_prose_comments(lines)
+        return py_hash_comments(lines)
     out = []
     heredoc = None
     block_indent = None
@@ -215,7 +287,7 @@ def prose_comments(lines, cfg):
         if heredoc is not None:
             if s == heredoc:
                 heredoc = None
-        elif s.startswith(cfg["prefixes"]) and not s.startswith("#!") and not DIRECTIVE.search(s):
+        elif s.startswith(cfg["prefixes"]) and not s.startswith("#!") and not is_directive(s):
             out.append((i, comment_body(s, cfg["prefixes"])))
         elif cfg["string_body"] == "heredoc" and (m := HEREDOC_OPEN.search(s)):
             heredoc = m.group(1)
@@ -224,49 +296,319 @@ def prose_comments(lines, cfg):
     return out
 
 
-def blocks(prose):
-    """Runs of contiguous prose comment lines as (start, end) pairs."""
-    runs = []
-    start = prev = None
-    for lineno, _ in prose:
-        if prev is not None and lineno == prev + 1:
-            prev = lineno
-        else:
-            if start is not None:
-                runs.append((start, prev))
-            start = prev = lineno
-    if start is not None:
-        runs.append((start, prev))
-    return runs
+def _block_piece(s):
+    """(text, closed) for a /* */ line, minus the `*` gutter, so `* - item` reads as a list."""
+    closed = "*/" in s
+    text = (s.split("*/", 1)[0] if closed else s).strip()
+    if text.startswith("*"):
+        text = text[1:].lstrip()
+    return text, closed
 
 
-def violations(prose, added, conf):
-    """Comment blocks over conf.max_lines that the change added or touched."""
-    return [(s, e) for s, e in blocks(prose)
-            if e - s + 1 > conf.max_lines and not added.isdisjoint(range(s, e + 1))]
+def comment_style(s, cfg, default):
+    """The run style for a comment opener: the language's doc style, or `default`."""
+    if s.startswith("////") or not s.startswith(cfg.get("doc_openers", ("/**",))):
+        return default
+    return cfg["doc"] if cfg["doc"] in DOC_STYLES else "jsdoc"
 
 
-def contrastive(prose, added, conf):
-    """Added one-line comments narrating the road not taken (blocking)."""
-    if not conf.contrastive:
-        return []
-    return [lineno for lineno, s in prose
-            if lineno in added and CONTRASTIVE.search(s)]
+def raw_open(s, mode):
+    """State of a string left open on line s, or None when none is."""
+    if mode == "rust_raw":
+        for m in RUST_RAW.finditer(s):
+            if ('"' + m.group(1)) not in s[m.end():]:
+                return len(m.group(1))
+        return None
+    return True if len(BACKTICK.findall(s)) % 2 else None
 
 
-def warnings(prose, added, conf):
-    """Added comment lines that are over-long or match a warn pattern."""
-    out = []
-    for lineno, s in prose:
-        if lineno not in added:
+def raw_closed(s, state, mode):
+    """True if line s closes the open string described by state."""
+    if mode == "rust_raw":
+        return ('"' + "#" * state) in s
+    return len(BACKTICK.findall(s)) % 2 == 1
+
+
+def slash_runs(lines, cfg):
+    """Runs for a //-comment language, skipping raw string and template literal bodies."""
+    runs, pending = [], []
+    raw = block_start = block_style = None
+    block_body = []
+    style = "line"
+    mode = cfg["string_body"]
+
+    def flush():
+        if pending:
+            runs.extend(group(pending, style))
+            pending.clear()
+
+    for i, rawline in enumerate(lines, 1):
+        s = rawline.strip()
+        if block_start is not None:
+            text, closed = _block_piece(s)
+            block_body.append(text)
+            if closed:
+                runs.append(Run(block_start, i, tuple(block_body), block_style))
+                block_start = None
             continue
-        if len(s) > conf.max_length:
-            out.append((lineno, f"over {conf.max_length} chars — a one-liner that "
-                                "long belongs in the README"))
+        if raw is not None:
+            if raw_closed(s, raw, mode):
+                raw = None
+            continue
+        if s.startswith("//"):
+            if is_directive(s):
+                flush()
+            else:
+                line_style = comment_style(s, cfg, "line")
+                if line_style != style:
+                    flush()
+                    style = line_style
+                pending.append((i, comment_body(s, cfg["prefixes"])))
+            continue
+        flush()
+        if s.startswith("/*"):
+            block_style = comment_style(s, cfg, "block")
+            head = s[3:] if block_style in DOC_STYLES else s[2:]
+            text, closed = _block_piece(head)
+            if closed:
+                runs.append(Run(i, i, (text,), block_style))
+            else:
+                block_start, block_body = i, [text]
+            continue
+        raw = raw_open(s, mode)
+    flush()
+    if block_start is not None:
+        runs.append(Run(block_start, len(lines), tuple(block_body), block_style))
+    return sorted(runs, key=lambda r: r.start)
+
+
+def docstring_runs(source):
+    """Runs for module, class and function docstrings, via the stdlib ast module."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    out = []
+    holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        text = ast.get_docstring(node, clean=True)
+        if text is None:
+            continue
+        expr = node.body[0]
+        out.append(Run(expr.lineno, expr.end_lineno,
+                       tuple(ln.strip() for ln in text.splitlines()), "docstring"))
+    return sorted(out, key=lambda r: r.start)
+
+
+def is_doc(run, lines, cfg):
+    """True if the run is a doc comment under its language's convention."""
+    if run.style in DOC_STYLES:
+        return True
+    if cfg["doc"] != "godoc" or run.style not in ("line", "block"):
+        return False
+    i = run.end
+    while i < len(lines) and lines[i].strip().startswith("//") and is_directive(lines[i]):
+        i += 1
+    return i < len(lines) and bool(GO_DECL.match(lines[i]))
+
+
+def strip_licence(run):
+    """(lineno, body) prose pairs, licence boilerplate removed and blank ends trimmed."""
+    kept, licensed = [], False
+    for offset, body in enumerate(run.lines):
+        if LICENCE_OPENER.match(body):
+            licensed = True
+            continue
+        if licensed or LICENCE.match(body):
+            continue
+        kept.append((run.start + offset, body))
+    while kept and not kept[0][1]:
+        kept.pop(0)
+    while kept and not kept[-1][1]:
+        kept.pop()
+    return kept
+
+
+def content_findings(prose):
+    """Findings that hold for every comment, doc or not — filler is filler at any length."""
+    out = []
+    for lineno, body in prose:
+        if DOC_PREAMBLE.match(body):
+            out.append(Finding(lineno, lineno, "block",
+                               "comment opens with filler ('This function…', 'This file…') "
+                               "— name the thing and say what it is for, or delete it"))
+        elif DOC_SECTION.match(body):
+            out.append(Finding(lineno, lineno, "block",
+                               "comment has a section header (Args:/Returns:/Example:) "
+                               "— the signature already says this"))
+        elif DOC_SIGNATURE.search(body):
+            out.append(Finding(lineno, lineno, "warn", "comment restates the signature"))
+    return out
+
+
+def trim(pairs):
+    """pairs with blank lines dropped from both ends."""
+    out = list(pairs)
+    while out and not out[0][1]:
+        out.pop(0)
+    while out and not out[-1][1]:
+        out.pop()
+    return out
+
+
+def strip_fences(prose):
+    """prose with fenced blocks and their fences dropped — a doctest counts as code."""
+    out, inside = [], False
+    for pair in prose:
+        if DOC_FENCE.match(pair[1]):
+            inside = not inside
+        elif not inside:
+            out.append(pair)
+    return out
+
+
+def split_sections(prose, cfg):
+    """(summary, sections) split at the first header that stands on its own."""
+    if cfg.get("sections"):
+        for i, (_, body) in enumerate(prose):
+            if KEPT_SECTION.match(body):
+                return prose[:i], prose[i:]
+    return prose, []
+
+
+def section_chunks(sections):
+    """One [header, *body] chunk per section."""
+    chunks = []
+    for pair in sections:
+        if KEPT_SECTION.match(pair[1]):
+            chunks.append([pair])
+        elif chunks:
+            chunks[-1].append(pair)
+    return chunks
+
+
+def safe_fn_below(run, lines):
+    """True where the run documents a plainly safe fn — clippy's unnecessary_safety_doc."""
+    for raw in lines[run.end:]:
+        s = raw.strip()
+        if s and not s.startswith(RUST_SKIP):
+            return bool(RUST_FN.match(s))
+    return False
+
+
+def section_says(header):
+    """Finding wording for one section, named by its own header."""
+    return (f"the `{header}` section", "keep one paragraph, move the rest to the README",
+            "cut to one concise paragraph")
+
+
+def para_findings(run, prose, conf, cfg, say):
+    """Structural bans at any length, then the prose-character budget, for one paragraph."""
+    label, trim_advice, cut_advice = say
+    out = []
+    for lineno, body in prose:
+        if not body:
+            out.append(Finding(run.start, run.end, "block",
+                               f"{label} runs to a second paragraph — {trim_advice}"))
+            break
+        if DOC_UNDERLINE.match(body):
+            out.append(Finding(lineno, lineno, "block", f"{label} has a section underline"))
+        elif DOC_BULLET.match(body):
+            out.append(Finding(lineno, lineno, "block",
+                               f"{label} contains a list — a list belongs in the README"))
+        elif cfg.get("typed") and DOC_TYPE_TAG.match(body):
+            out.append(Finding(lineno, lineno, "block",
+                               "@param/@returns duplicates the typed signature"))
+    chars = len(" ".join(body for _, body in prose).strip())
+    if chars > conf.max_doc_chars:
+        out.append(Finding(run.start, run.end, "block",
+                           f"{label} is {chars} chars of prose, budget "
+                           f"{conf.max_doc_chars} — {cut_advice}"))
+    elif chars > conf.warn_doc_chars:
+        out.append(Finding(run.start, run.end, "warn",
+                           f"{label} is {chars} chars of prose — getting wordy, "
+                           f"{conf.warn_doc_chars} is the comfortable ceiling"))
+    return out
+
+
+def doc_findings(run, prose, conf, cfg, lines):
+    """Tier 2 findings: the summary paragraph, then each section in its own right."""
+    summary, sections = split_sections(prose, cfg)
+    out = para_findings(run, trim(summary), conf, cfg, SUMMARY_SAYS)
+    for chunk in section_chunks(sections):
+        lineno, header = chunk[0]
+        out += para_findings(run, trim(chunk[1:]), conf, cfg, section_says(header))
+        if SAFETY_SECTION.match(header) and safe_fn_below(run, lines):
+            out.append(Finding(lineno, lineno, "warn",
+                               f"`{header}` documents a safe fn — clippy's "
+                               "unnecessary_safety_doc flags this; drop the section"))
+    return out
+
+
+def ordinary_findings(run, prose, conf):
+    """Tier 1 findings: one line, or none."""
+    out = []
+    if len(prose) > conf.max_lines:
+        plural = "line" if conf.max_lines == 1 else "lines"
+        out.append(Finding(run.start, run.end, "block",
+                           f"comment block longer than {conf.max_lines} {plural} — keep "
+                           f"one non-obvious 'why' line, else the README"))
+    for lineno, body in prose:
+        if len(body) > conf.max_length:
+            out.append(Finding(lineno, lineno, "warn",
+                               f"comment over {conf.max_length} chars — a one-liner that "
+                               "long belongs in the README"))
         for pattern, label in conf.warn_patterns:
-            if pattern.match(s):
-                out.append((lineno, label))
+            if pattern.match(body):
+                out.append(Finding(lineno, lineno, "warn", f"comment {label}"))
                 break
+    return out
+
+
+def run_findings(run, lines, conf, cfg):
+    """Every finding for one comment run, licence lines excluded from the reckoning."""
+    prose = strip_licence(run)
+    doc = is_doc(run, lines, cfg)
+    if doc:
+        prose = strip_fences(prose)
+    if not prose:
+        return []
+    out = content_findings(prose)
+    if conf.contrastive:
+        for lineno, body in prose:
+            if CONTRASTIVE.search(body):
+                out.append(Finding(lineno, lineno, "block",
+                                   "comment narrates the road not taken ('do X, not Y' / "
+                                   "what the code doesn't do) — state the why plainly "
+                                   "or move it to the README"))
+    if doc:
+        return out + doc_findings(run, prose, conf, cfg, lines)
+    return out + ordinary_findings(run, prose, conf)
+
+
+def file_runs(lines, source, conf, cfg):
+    """Every comment run in the file, across both the comment and doc-comment syntaxes."""
+    runs = slash_runs(lines, cfg) if cfg["kind"] == "slash" else group(hash_comments(lines, cfg))
+    if cfg["doc"] == "docstring" and conf.docstrings:
+        runs += docstring_runs(source)
+    return sorted(runs, key=lambda r: r.start)
+
+
+def check_file(path, cfg, conf, whole_file=False):
+    """Findings for one file. Raises OSError/UnicodeDecodeError if it can't be read."""
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    lines = source.splitlines()
+    added = None if whole_file else added_linenos(path)
+    if added is None:
+        added = set(range(1, len(lines) + 1))
+    out = []
+    for run in file_runs(lines, source, conf, cfg):
+        if added.isdisjoint(range(run.start, run.end + 1)):
+            continue
+        out.extend(run_findings(run, lines, conf, cfg))
     return out
 
 
@@ -297,71 +639,33 @@ def parse_added(diff):
 
 
 def added_linenos(path):
-    """Line numbers the change adds/edits in path (working tree vs HEAD).
-
-    None when there's no diff (e.g. a brand-new untracked file), so the caller
-    audits the whole file — all of a new file is new.
-    """
+    """Line numbers the change adds or edits in path, or None when there's no diff."""
     diff = _git("diff", "--unified=0", "HEAD", "--", path)
     return parse_added(diff) if diff.strip() else None
 
 
-def check_file(path, cfg, conf, whole_file=False):
-    """Findings for one file. Raises OSError/UnicodeDecodeError if it can't be read.
-
-    The caller decides what an unreadable file means: the CLI fails, the hooks
-    skip it. A linter that silently inspects nothing must never look like a pass.
-    """
-    with open(path, encoding="utf-8") as f:
-        lines = f.read().splitlines()
-    added = None if whole_file else added_linenos(path)
-    if added is None:
-        added = set(range(1, len(lines) + 1))
-    prose = prose_comments(lines, cfg)
-    return (violations(prose, added, conf),
-            contrastive(prose, added, conf),
-            warnings(prose, added, conf))
-
-
 def collect(paths, conf, whole_file=False, skip_unreadable=False):
-    """(violation lines, warning lines) as human-readable strings across paths.
-
-    whole_file audits every line (the CLI audit); otherwise scope to the change.
-    skip_unreadable swallows a file that vanished or won't decode — the hooks race
-    against an agent still editing, where the CLI wants the error.
-    """
+    """(blocking lines, warning lines) as human-readable strings across paths."""
     viol_lines, warn_lines = [], []
     for path in paths:
         cfg = lang_for(path)
         if cfg is None or excluded(path, conf.exclude):
             continue
         try:
-            viols, contras, warns = check_file(path, cfg, conf, whole_file)
+            findings = check_file(path, cfg, conf, whole_file)
         except (OSError, UnicodeDecodeError) as exc:
             if skip_unreadable:
                 continue
             raise ReadError(f"{path}: {exc}") from exc
-        for start, end in viols:
-            plural = "line" if conf.max_lines == 1 else "lines"
-            viol_lines.append(f"{path}:{start}-{end}: comment block longer than "
-                              f"{conf.max_lines} {plural} — keep one non-obvious "
-                              f"'why' line, else the README")
-        for lineno in contras:
-            viol_lines.append(f"{path}:{lineno}: comment narrates the road not taken "
-                              f"('do X, not Y' / what the code doesn't do) — state the "
-                              f"why plainly or move it to the README")
-        for lineno, why in warns:
-            warn_lines.append(f"{path}:{lineno}: comment {why}")
+        for f in findings:
+            span = f"{f.start}" if f.start == f.end else f"{f.start}-{f.end}"
+            target = viol_lines if f.level == "block" else warn_lines
+            target.append(f"{path}:{span}: {f.message}")
     return viol_lines, warn_lines
 
 
 def changed_files():
-    """Supported files the turn touched: HEAD diff + untracked new files.
-
-    `git diff HEAD` omits untracked files, but Claude's Write tool creates new
-    files untracked, so include `ls-files --others`. The diff also reports
-    deleted/renamed-away paths, so drop any that no longer exist on disk.
-    """
+    """Supported files the turn touched: the HEAD diff plus untracked new files."""
     files = _git("diff", "--name-only", "HEAD").splitlines()
     files += _git("ls-files", "--others", "--exclude-standard").splitlines()
     return sorted({p for p in files
@@ -369,7 +673,7 @@ def changed_files():
 
 
 def _block(viol_lines, warn_lines):
-    """Emit a block decision with the fix reason; 0 (no violation) otherwise."""
+    """Emit a block decision with the fix reason, or return 0 when nothing was flagged."""
     if not viol_lines:
         return 0
     reason = "\n".join([*viol_lines, *warn_lines, "", FIX])
@@ -378,12 +682,7 @@ def _block(viol_lines, warn_lines):
 
 
 def post_tool_use_hook():
-    """PostToolUse hook for Write/Edit/MultiEdit: lint the just-edited file.
-
-    Fires the moment an edit lands — before any same-turn `git commit`, while the
-    change still sits uncommitted in the working tree, so `git diff HEAD` scopes
-    it correctly. The Stop hook can't see a change committed mid-turn; this can.
-    """
+    """Lint the just-edited file, before any same-turn commit moves it out of the diff."""
     try:
         payload = json.load(sys.stdin)
     except ValueError:
@@ -395,12 +694,7 @@ def post_tool_use_hook():
 
 
 def stop_hook():
-    """Stop-hook backstop: catch turn-touched files the PostToolUse hook missed.
-
-    Deterministic tripwire (the regex), LLM resolution (Claude reads `reason` and
-    decides keep-one-line / move-to-README / delete). Warnings ride along in the
-    reason but never trip the block on their own.
-    """
+    """Backstop the whole turn: a regex is the tripwire, the agent is the resolver."""
     try:
         payload = json.load(sys.stdin)
     except ValueError:
@@ -417,12 +711,7 @@ USAGE = ("usage: comment_diet.py <file>... — audits whole files.\n"
 
 
 def check_argv(argv):
-    """Reason the arguments can't be audited, or None.
-
-    Guards against a mis-invocation that inspects nothing — the whole file list
-    arriving as one unsplit argument, a typo'd path, a scope with no supported
-    files. Each of those used to exit 0 and read as a clean bill of health.
-    """
+    """Reason the arguments can't be audited, or None — a bad scope must never read as a pass."""
     if not argv:
         return USAGE
     missing = [p for p in argv if not os.path.exists(p)]
