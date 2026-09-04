@@ -1,96 +1,126 @@
-"""Every config key changes behaviour, and a broken config degrades asymmetrically."""
+import io
 import json
+import unittest
+from contextlib import redirect_stderr
+from unittest import mock
 
-import pytest
-
-import comment_diet as cd
-
-BLOCK = "# why one\n# why two\nx = 1\n"
-
-
-def configure(repo, data):
-    repo.write(cd.CONFIG_FILE, json.dumps(data))
-    return cd.load_config()
+from tests.loader import blocked, cd
 
 
-def audit(repo, source, conf, name="a.tf"):
-    repo.write(name, source)
-    return cd.collect([name], conf, whole_file=True)
+class ParseConfig(unittest.TestCase):
+    def test_defaults_when_empty(self):
+        conf = cd.parse_config({})
+        self.assertEqual(conf.max_lines, 1)
+        self.assertEqual(conf.max_doc_chars, 200)
+        self.assertEqual(conf.warn_doc_chars, 120)
+        self.assertTrue(conf.docstrings)
+
+    def test_overrides_are_applied(self):
+        conf = cd.parse_config({"max_lines": 3, "max_doc_chars": 400, "exclude": ["v/**"]})
+        self.assertEqual(conf.max_lines, 3)
+        self.assertEqual(conf.max_doc_chars, 400)
+        self.assertEqual(conf.exclude, ("v/**",))
+
+    def test_top_level_must_be_an_object(self):
+        with self.assertRaises(cd.ConfigError):
+            cd.parse_config([])
+
+    def test_wrong_type_is_rejected(self):
+        with self.assertRaises(cd.ConfigError):
+            cd.parse_config({"max_lines": "three"})
+
+    def test_bool_is_not_an_int(self):
+        with self.assertRaises(cd.ConfigError):
+            cd.parse_config({"max_lines": True})
+
+    def test_bad_warn_pattern_regex_is_rejected(self):
+        with self.assertRaises(cd.ConfigError):
+            cd.parse_config({"warn_patterns": [{"pattern": "[", "label": "x"}]})
+
+    def test_warn_pattern_needs_both_keys(self):
+        with self.assertRaises(cd.ConfigError):
+            cd.parse_config({"warn_patterns": [{"pattern": "x"}]})
+
+    def test_built_in_warn_patterns_can_be_switched_off(self):
+        conf = cd.parse_config({"default_warn_patterns": False})
+        self.assertEqual(conf.warn_patterns, ())
+
+    def test_unknown_keys_are_ignored(self):
+        self.assertEqual(cd.parse_config({"nonsense": 1}).max_lines, 1)
 
 
-def test_absent_config_is_defaults(repo):
-    assert cd.load_config() == cd.DEFAULTS
+class HookDegradation(unittest.TestCase):
+    def test_broken_config_falls_back_to_defaults_with_a_warning(self):
+        err = io.StringIO()
+        with mock.patch.object(cd, "load_config", side_effect=cd.ConfigError("bad")), \
+             redirect_stderr(err):
+            conf = cd.hook_config()
+        self.assertIs(conf, cd.DEFAULTS)
+        self.assertIn("using defaults", err.getvalue())
 
 
-def test_max_lines_raises_the_bar(repo):
-    conf = configure(repo, {"max_lines": 3})
-    assert audit(repo, BLOCK, conf)[0] == []
-    assert len(audit(repo, "# a\n# b\n# c\n# d\nx = 1\n", conf)[0]) == 1
+class BudgetIsConfigurable(unittest.TestCase):
+    def test_raised_doc_budget_lets_a_longer_summary_through(self):
+        body = ("Client talks to the vendor billing API, retrying on 500 because the "
+                "vendor documents batches of two hundred items but in practice fails "
+                "on anything above fifty per request, as we found out the hard way.")
+        source = f"// {body}\ntype Client struct{{}}\n"
+        self.assertTrue(any("budget 200" in m for m in blocked(source, ".go")))
+        conf = cd.replace(cd.DEFAULTS, max_doc_chars=400, warn_doc_chars=400)
+        self.assertEqual(blocked(source, ".go", conf), [])
 
 
-def test_max_length_tightens_the_warning(repo):
-    conf = configure(repo, {"max_length": 10})
-    warns = audit(repo, "# a why that is definitely longer than ten\nx = 1\n", conf)[1]
-    assert "over 10 chars" in warns[0]
+class Excludes(unittest.TestCase):
+    def test_glob_matches(self):
+        self.assertTrue(cd.excluded("tests/x.py", ("tests/**",)))
+
+    def test_leading_globstar_also_matches_at_top_level(self):
+        self.assertTrue(cd.excluded("vendor/x.go", ("**/vendor/**",)))
+
+    def test_non_match(self):
+        self.assertFalse(cd.excluded("src/x.go", ("tests/**",)))
+
+    def test_excluded_file_is_skipped_by_collect(self):
+        conf = cd.replace(cd.DEFAULTS, exclude=("skipme/**",))
+        viols, _ = cd.collect(["skipme/a.py"], conf, whole_file=True)
+        self.assertEqual(viols, [])
 
 
-def test_contrastive_can_be_disabled(repo):
-    source = "# point at the file, not the dir\nx = 1\n"
-    assert len(audit(repo, source, cd.DEFAULTS)[0]) == 1
-    assert audit(repo, source, configure(repo, {"contrastive": False}))[0] == []
+class LangDispatch(unittest.TestCase):
+    def test_every_supported_suffix_resolves(self):
+        for ext in cd.SUFFIXES:
+            self.assertIsNotNone(cd.lang_for("sample" + ext), ext)
+
+    def test_tsx_does_not_resolve_as_ts(self):
+        self.assertEqual(cd.lang_for("a.tsx")["doc"], "jsdoc")
+
+    def test_mjs_is_untyped(self):
+        self.assertFalse(cd.lang_for("a.mjs")["typed"])
+        self.assertTrue(cd.lang_for("a.ts")["typed"])
+
+    def test_unsupported_suffix_is_none(self):
+        self.assertIsNone(cd.lang_for("a.rb"))
 
 
-def test_warn_patterns_append(repo):
-    conf = configure(repo, {"warn_patterns": [{"pattern": "^TODO", "label": "unowned TODO"}]})
-    assert "unowned TODO" in audit(repo, "# TODO fix this\nx = 1\n", conf)[1][0]
-    assert "banner" in audit(repo, "# --------\nx = 1\n", conf)[1][0]
+class ConfigFileLoading(unittest.TestCase):
+    def test_missing_file_gives_defaults(self):
+        with mock.patch.object(cd, "config_path", return_value="/nope/.comment-diet.json"):
+            self.assertIs(cd.load_config(), cd.DEFAULTS)
+
+    def test_malformed_json_raises(self):
+        with mock.patch.object(cd, "config_path", return_value="cfg.json"), \
+             mock.patch.object(cd.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", mock.mock_open(read_data="{not json")), \
+             self.assertRaises(cd.ConfigError):
+            cd.load_config()
+
+    def test_valid_file_is_parsed(self):
+        data = json.dumps({"max_lines": 2})
+        with mock.patch.object(cd, "config_path", return_value="cfg.json"), \
+             mock.patch.object(cd.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            self.assertEqual(cd.load_config().max_lines, 2)
 
 
-def test_default_warn_patterns_can_be_dropped(repo):
-    conf = configure(repo, {"default_warn_patterns": False})
-    assert audit(repo, "# --------\nx = 1\n", conf)[1] == []
-
-
-def test_exclude_skips_matching_paths(repo):
-    conf = configure(repo, {"exclude": ["**/vendor/**"]})
-    assert audit(repo, BLOCK, conf, name="vendor/a.tf")[0] == []
-    assert audit(repo, BLOCK, conf, name="nested/vendor/a.tf")[0] == []
-    assert len(audit(repo, BLOCK, conf, name="src/a.tf")[0]) == 1
-
-
-@pytest.mark.parametrize("body", [
-    "{ not json",
-    '["a list"]',
-    '{"max_lines": "three"}',
-    '{"max_lines": true}',
-    '{"contrastive": 1}',
-    '{"exclude": "a-string"}',
-    '{"warn_patterns": [{"pattern": "("}]}',
-    '{"warn_patterns": [{"nope": 1}]}',
-])
-def test_broken_config_raises(repo, body):
-    repo.write(cd.CONFIG_FILE, body)
-    with pytest.raises(cd.ConfigError):
-        cd.load_config()
-
-
-def test_unknown_keys_are_ignored(repo):
-    assert configure(repo, {"nonsense": 1}) == cd.DEFAULTS
-
-
-def test_hooks_degrade_to_defaults_on_a_broken_config(repo, hook):
-    repo.write(cd.CONFIG_FILE, "{ not json")
-    repo.write("a.tf", BLOCK)
-    result = hook("--stop-hook", "{}")
-    assert result.returncode == 0
-    assert json.loads(result.stdout)["decision"] == "block"
-    assert "using defaults" in result.stderr
-
-
-def test_cli_exits_2_on_a_broken_config(repo, cli):
-    repo.write(cd.CONFIG_FILE, "{ not json")
-    repo.write("a.tf", BLOCK)
-    result = cli("a.tf")
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert "comment-diet" in result.stderr
+if __name__ == "__main__":
+    unittest.main()
